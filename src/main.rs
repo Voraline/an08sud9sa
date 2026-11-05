@@ -12,7 +12,6 @@ fn main() {
     }
 
     if arguments.len() < index + 4 {
-        println!("VoicePlay [--selfbot] <GuildId> <ChannelId> <File> <Token> [Token...]");
         std::process::exit(1);
     }
 
