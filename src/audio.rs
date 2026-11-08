@@ -52,31 +52,6 @@ impl AudioResource {
 
         false
     }
-
-    /// Drop `frames` worth of audio without producing packets.
-    pub fn skip(&mut self, frames: usize) {
-        let mut left = frames;
-        if left == 0 {
-            return;
-        }
-
-        if self.silence_remaining > 0 {
-            let dropped = left.min(self.silence_remaining as usize);
-            self.silence_remaining -= dropped as i64;
-            left -= dropped;
-        }
-
-        if left > 0 {
-            let available = self.audio.frames.len().saturating_sub(self.cursor);
-            let dropped = left.min(available);
-            self.cursor += dropped;
-            left -= dropped;
-        }
-
-        if left > 0 && self.silence_remaining == -1 && self.cursor >= self.audio.frames.len() {
-            self.silence_remaining = self.padding.saturating_sub(left) as i64;
-        }
-    }
 }
 
 struct PlayerState {
@@ -123,23 +98,6 @@ impl AudioPlayer {
         }
         self.set_status(AudioPlayerStatus::Idle);
         true
-    }
-
-    /// Move the cursor forward without producing packets.
-    ///
-    /// The lockstep pacer calls this when the shared clock outruns the host:
-    /// every bot skips the same frames, so the content position is decided by
-    /// the clock and never by a bot's private counter.
-    pub fn advance(&self, frames: usize) {
-        if frames == 0 {
-            return;
-        }
-        let mut state = self.state.lock();
-        let Some(resource) = state.resource.as_mut() else {
-            return;
-        };
-        resource.skip(frames);
-        state.missed_frames = 0;
     }
 
     pub fn status(&self) -> AudioPlayerStatus {

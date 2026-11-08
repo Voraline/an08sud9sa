@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -12,7 +12,6 @@ use crate::crypto;
 use crate::gateway::GatewayClient;
 use crate::opus;
 use crate::realtime::{self, FALLBACK_SPIN_WINDOW, REALTIME_SPIN_WINDOW};
-use crate::sync;
 use crate::types::{
     AudioPlayerStatus, BotOptions, EncodedAudio, EncoderOptions, JoinConfig, PlaybackOptions,
     VoiceConnectionStatus, VoiceServerInfo, VoiceStateInfo,
@@ -21,6 +20,11 @@ use crate::types::{
 pub type ErrorHandler = Arc<dyn Fn(&str, &str) + Send + Sync>;
 pub type DebugHandler = Arc<dyn Fn(&str) + Send + Sync>;
 pub type FinishedHandler = Arc<dyn Fn() + Send + Sync>;
+
+const FRAME_MILLIS: u64 = 20;
+const TIMESTAMP_INCREMENT: u32 = 960;
+const SYNC_START_FRAME: usize = 20;
+const SYNC_SAMPLE_COUNT: usize = 200;
 
 struct BotSlot {
     connection: Option<Arc<VoiceConnection>>,
@@ -52,41 +56,6 @@ struct Playback {
     name: String,
     connection: Arc<VoiceConnection>,
     player: Arc<AudioPlayer>,
-}
-
-/// One bot as the lockstep pacer sees it. Warm-up frames are sent as Opus
-/// silence without touching the player cursor, so the pre-roll never consumes
-/// track audio.
-struct PlaybackSink {
-    connection: Arc<VoiceConnection>,
-    player: Arc<AudioPlayer>,
-    warmup: usize,
-}
-
-impl sync::Sink for PlaybackSink {
-    fn prepare(&self, frame: usize, sequence: u16, timestamp: u32) {
-        if frame < self.warmup {
-            self.connection.prepare_audio_packet_fast(
-                EncodedAudio::silence_frame(),
-                sequence,
-                timestamp,
-            );
-        } else {
-            self.player.step_prepare(sequence, timestamp);
-        }
-    }
-
-    fn dispatch(&self) -> bool {
-        self.connection.dispatch_audio()
-    }
-
-    fn advance(&self, frames: usize) {
-        self.player.advance(frames);
-    }
-
-    fn finished(&self) -> bool {
-        self.player.status() == AudioPlayerStatus::Idle
-    }
 }
 
 struct ClientInner {
@@ -706,76 +675,227 @@ impl ClientInner {
     }
 
     fn run_scheduler(self: Arc<Self>, audio: Arc<EncodedAudio>, active: Vec<Playback>) {
-        if active.is_empty() {
-            self.playing.store(false, Ordering::Release);
-            let mut state = self.state.lock();
-            state.finished = true;
-            drop(state);
-            self.condition.notify_all();
-            return;
-        }
-
         let cpus = realtime::allowed_cpus();
         let locked = realtime::lock_memory();
-        let pinned = cpus
-            .last()
-            .map(|cpu| realtime::pin_current_thread(*cpu))
-            .unwrap_or(false);
-        let realtime_ok = realtime::elevate_current_thread();
-        let spin = if realtime_ok {
-            REALTIME_SPIN_WINDOW
-        } else {
-            FALLBACK_SPIN_WINDOW
-        };
+        let count = active.len();
+        let parallel =
+            count > 1 && count >= self.settings.parallel_threshold && cpus.len() >= count;
+        let measure = self.settings.debug && count > 1;
 
-        // The clock starts now. `lead_time` is spent as pre-roll silence, so
-        // every listener stream is established before the first audible frame.
-        let frame_duration = Duration::from_millis(sync::FRAME_MILLIS);
-        let warmup = sync::preroll_frames(
-            self.settings.lead_time,
-            frame_duration,
-            self.settings.warmup_frames,
-        );
+        let frame_duration = Duration::from_millis(FRAME_MILLIS);
+        let start_time = Instant::now() + self.settings.lead_time;
+        let base_sequence = crypto::random_u16();
+        let base_timestamp = crypto::random_u32();
+        let warmup = self.settings.warmup_frames;
         let maximum_frames =
             warmup + audio.frames.len() + self.settings.silence_padding_frames + 100;
 
-        let targets: Vec<sync::Target> = active
-            .iter()
-            .map(|playback| {
-                sync::Target::new(
-                    playback.name.clone(),
-                    Arc::new(PlaybackSink {
-                        connection: playback.connection.clone(),
-                        player: playback.player.clone(),
-                        warmup,
-                    }),
-                )
-            })
-            .collect();
-
-        let config = sync::PacerConfig {
-            frame_duration,
-            maximum_frames,
-            warmup_frames: warmup,
-            base_sequence: crypto::random_u16(),
-            base_timestamp: crypto::random_u32(),
-            spin_window: spin,
-            sample_capacity: sync::DEFAULT_SAMPLE_CAPACITY,
+        let deadline_of = |frame: usize| start_time + frame_duration * frame as u32;
+        let late_frames = |frame: usize, now: Instant| {
+            let lag = now.saturating_duration_since(deadline_of(frame));
+            if lag < frame_duration {
+                0
+            } else {
+                let frames = (lag.as_millis() / FRAME_MILLIS as u128) as usize;
+                frames.min(maximum_frames - 1 - frame)
+            }
+        };
+        let prepare = |target: &Playback, frame: usize| {
+            let sequence = base_sequence.wrapping_add(frame as u16);
+            let timestamp =
+                base_timestamp.wrapping_add((frame as u32).wrapping_mul(TIMESTAMP_INCREMENT));
+            if frame < warmup {
+                target.connection.prepare_audio_packet_fast(
+                    EncodedAudio::silence_frame(),
+                    sequence,
+                    timestamp,
+                );
+            } else {
+                target.player.step_prepare(sequence, timestamp);
+            }
         };
 
-        let report = sync::Pacer::new(config).run(&targets, &self.stopping, |message| {
-            self.log(message);
-        });
+        let epoch = Instant::now();
+        let mut sync_samples = vec![0i64; SYNC_SAMPLE_COUNT];
+        let mut sync_count = 0usize;
+        let mut max_skew = 0i64;
 
-        self.log(format!(
-            "[SYNC] bots={} pinned={} realtime={} locked={} warmup={} {}",
-            active.len(),
-            if pinned { 1 } else { 0 },
-            if realtime_ok { 1 } else { 0 },
-            if locked { 1 } else { 0 },
-            warmup,
-            report.summary()
-        ));
+        if parallel {
+            self.log(format!(
+                "[SYNC] mode=parallel workers={} locked={}",
+                count,
+                if locked { 1 } else { 0 }
+            ));
+
+            let stamps: Vec<AtomicI64> = (0..if measure {
+                count * SYNC_SAMPLE_COUNT
+            } else {
+                0
+            })
+            .map(|_| AtomicI64::new(0))
+            .collect();
+
+            thread::scope(|scope| {
+                for (index, target) in active.iter().enumerate() {
+                    let cpus = &cpus;
+                    let stopping = &self.stopping;
+                    let prepare = &prepare;
+                    let deadline_of = &deadline_of;
+                    let late_frames = &late_frames;
+                    let stamps = &stamps;
+
+                    scope.spawn(move || {
+                        realtime::pin_current_thread(cpus[cpus.len() - 1 - index]);
+                        let realtime_ok = realtime::elevate_current_thread();
+                        let spin = if realtime_ok {
+                            REALTIME_SPIN_WINDOW
+                        } else {
+                            FALLBACK_SPIN_WINDOW
+                        };
+
+                        let mut frame = 0usize;
+                        prepare(target, frame);
+                        while frame < maximum_frames {
+                            if target.player.status() == AudioPlayerStatus::Idle
+                                || stopping.load(Ordering::Relaxed)
+                            {
+                                break;
+                            }
+
+                            let now = realtime::wait_until(deadline_of(frame), spin, stopping);
+                            if stopping.load(Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let skip = late_frames(frame, now);
+                            for ahead in 1..=skip {
+                                prepare(target, frame + ahead);
+                            }
+                            frame += skip;
+
+                            if measure
+                                && (SYNC_START_FRAME
+                                    ..SYNC_START_FRAME + SYNC_SAMPLE_COUNT)
+                                    .contains(&frame)
+                            {
+                                stamps[index * SYNC_SAMPLE_COUNT
+                                    + (frame - SYNC_START_FRAME)]
+                                    .store(now_elapsed_ns(epoch), Ordering::Relaxed);
+                            }
+
+                            target.connection.dispatch_audio();
+                            frame += 1;
+                            prepare(target, frame);
+                        }
+                    });
+                }
+            });
+
+            if measure {
+                for slot in 0..SYNC_SAMPLE_COUNT {
+                    let mut low = i64::MAX;
+                    let mut high = 0i64;
+                    let mut complete = true;
+                    for index in 0..count {
+                        let value = stamps[index * SYNC_SAMPLE_COUNT + slot]
+                            .load(Ordering::Relaxed);
+                        if value == 0 {
+                            complete = false;
+                            break;
+                        }
+                        low = low.min(value);
+                        high = high.max(value);
+                    }
+                    if complete {
+                        sync_samples[sync_count] = high - low;
+                        max_skew = max_skew.max(high - low);
+                        sync_count += 1;
+                    }
+                }
+            }
+        } else {
+            let pinned = cpus
+                .last()
+                .map(|cpu| realtime::pin_current_thread(*cpu))
+                .unwrap_or(false);
+            let realtime_ok = realtime::elevate_current_thread();
+            let spin = if realtime_ok {
+                REALTIME_SPIN_WINDOW
+            } else {
+                FALLBACK_SPIN_WINDOW
+            };
+            self.log(format!(
+                "[SYNC] mode=serial realtime={} pinned={} locked={}",
+                if realtime_ok { 1 } else { 0 },
+                if pinned { 1 } else { 0 },
+                if locked { 1 } else { 0 }
+            ));
+
+            for target in &active {
+                prepare(target, 0);
+            }
+
+            let mut frame = 0usize;
+            while frame < maximum_frames {
+                let any_active = active
+                    .iter()
+                    .any(|target| target.player.status() != AudioPlayerStatus::Idle);
+                if !any_active || self.stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let now = realtime::wait_until(deadline_of(frame), spin, &self.stopping);
+                if self.stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let skip = late_frames(frame, now);
+                if skip > 0 {
+                    for target in &active {
+                        for ahead in 1..=skip {
+                            prepare(target, frame + ahead);
+                        }
+                    }
+                    frame += skip;
+                }
+
+                let offset = frame % count;
+                if measure && frame >= SYNC_START_FRAME && sync_count < SYNC_SAMPLE_COUNT {
+                    let first = Instant::now();
+                    let mut last = first;
+                    for step in 0..count {
+                        last = Instant::now();
+                        active[(offset + step) % count].connection.dispatch_audio();
+                    }
+                    let skew = last.duration_since(first).as_nanos() as i64;
+                    max_skew = max_skew.max(skew);
+                    sync_samples[sync_count] = skew;
+                    sync_count += 1;
+                } else {
+                    for step in 0..count {
+                        active[(offset + step) % count].connection.dispatch_audio();
+                    }
+                }
+
+                frame += 1;
+                for target in &active {
+                    prepare(target, frame);
+                }
+            }
+        }
+
+        if measure && sync_count > 0 {
+            let mut samples = sync_samples[..sync_count].to_vec();
+            samples.sort_unstable();
+            let p50 = samples[sync_count * 50 / 100];
+            let p95 = samples[(sync_count - 1).min(sync_count * 95 / 100)];
+            self.log(format!(
+                "[SYNC] local dispatch p50={}us p95={}us max={}us",
+                p50 as f64 / 1000.0,
+                p95 as f64 / 1000.0,
+                max_skew as f64 / 1000.0
+            ));
+        }
 
         self.playing.store(false, Ordering::Release);
         for target in &active {
@@ -795,4 +915,8 @@ impl ClientInner {
             callback();
         }
     }
+}
+
+fn now_elapsed_ns(epoch: Instant) -> i64 {
+    Instant::now().duration_since(epoch).as_nanos() as i64
 }
