@@ -7,6 +7,7 @@ pub mod gateway;
 pub mod networking;
 pub mod opus;
 pub mod realtime;
+pub mod sync;
 pub mod types;
 pub mod udp;
 pub mod ws;
