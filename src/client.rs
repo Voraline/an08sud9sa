@@ -11,7 +11,7 @@ use crate::connection::VoiceConnection;
 use crate::crypto;
 use crate::gateway::GatewayClient;
 use crate::opus;
-use crate::realtime::{self, FALLBACK_SPIN_WINDOW, REALTIME_SPIN_WINDOW};
+use crate::realtime::{self, SpinBarrier, BARRIER_LEAD, FALLBACK_SPIN_WINDOW, REALTIME_SPIN_WINDOW};
 use crate::types::{
     AudioPlayerStatus, BotOptions, EncodedAudio, EncoderOptions, JoinConfig, PlaybackOptions,
     VoiceConnectionStatus, VoiceServerInfo, VoiceStateInfo,
@@ -735,8 +735,11 @@ impl ClientInner {
             .map(|_| AtomicI64::new(0))
             .collect();
 
+            let barrier = SpinBarrier::new(count);
+
             thread::scope(|scope| {
                 for (index, target) in active.iter().enumerate() {
+                    let barrier = &barrier;
                     let cpus = &cpus;
                     let stopping = &self.stopping;
                     let prepare = &prepare;
@@ -762,7 +765,15 @@ impl ClientInner {
                                 break;
                             }
 
-                            let now = realtime::wait_until(deadline_of(frame), spin, stopping);
+                            let deadline = deadline_of(frame);
+                            let rendezvous = deadline.checked_sub(BARRIER_LEAD).unwrap_or(deadline);
+                            realtime::wait_until(rendezvous, spin, stopping);
+                            if stopping.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            barrier.wait(stopping);
+
+                            let now = realtime::wait_until(deadline, spin, stopping);
                             if stopping.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -787,6 +798,7 @@ impl ClientInner {
                             frame += 1;
                             prepare(target, frame);
                         }
+                        barrier.abort();
                     });
                 }
             });

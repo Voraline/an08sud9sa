@@ -1,8 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const REALTIME_SPIN_WINDOW: Duration = Duration::from_micros(250);
 pub const FALLBACK_SPIN_WINDOW: Duration = Duration::from_millis(1);
+pub const BARRIER_LEAD: Duration = Duration::from_micros(100);
 const MAX_SLEEP_SLICE: Duration = Duration::from_millis(50);
 
 pub fn init_timer_resolution() {
@@ -118,5 +119,46 @@ pub fn wait_until(deadline: Instant, spin: Duration, stopping: &AtomicBool) -> I
         } else {
             std::hint::spin_loop();
         }
+    }
+}
+
+pub struct SpinBarrier {
+    parties: usize,
+    arrived: AtomicUsize,
+    generation: AtomicUsize,
+    aborted: AtomicBool,
+}
+
+impl SpinBarrier {
+    pub fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            arrived: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+            aborted: AtomicBool::new(false),
+        }
+    }
+
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    pub fn wait(&self, stopping: &AtomicBool) -> bool {
+        if self.aborted.load(Ordering::Acquire) {
+            return false;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 == self.parties {
+            self.arrived.store(0, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Release);
+            return true;
+        }
+        while self.generation.load(Ordering::Acquire) == generation {
+            if self.aborted.load(Ordering::Acquire) || stopping.load(Ordering::Relaxed) {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
     }
 }
