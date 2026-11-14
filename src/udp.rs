@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -46,6 +46,8 @@ pub struct VoiceUdpSocket {
     receive_thread: Mutex<Option<JoinHandle<()>>>,
     keepalive_thread: Mutex<Option<JoinHandle<()>>>,
     txtime: AtomicBool,
+    txtime_errors: AtomicU64,
+    txtime_errno: AtomicI32,
 }
 
 impl VoiceUdpSocket {
@@ -82,6 +84,8 @@ impl VoiceUdpSocket {
             receive_thread: Mutex::new(None),
             keepalive_thread: Mutex::new(None),
             txtime: AtomicBool::new(false),
+            txtime_errors: AtomicU64::new(0),
+            txtime_errno: AtomicI32::new(0),
         });
 
         let receive_shared = shared.clone();
@@ -105,6 +109,13 @@ impl VoiceUdpSocket {
 
     pub fn txtime_active(&self) -> bool {
         self.txtime.load(Ordering::Relaxed)
+    }
+
+    pub fn txtime_errors(&self) -> (u64, i32) {
+        (
+            self.txtime_errors.load(Ordering::Relaxed),
+            self.txtime_errno.load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -172,8 +183,16 @@ impl VoiceUdpSocket {
             (*header).cmsg_len = libc::CMSG_LEN(8) as _;
             std::ptr::write_unaligned(libc::CMSG_DATA(header) as *mut u64, txtime_ns);
 
-            libc::sendmsg(self.socket.as_raw_fd(), &message, 0) >= 0
+            if libc::sendmsg(self.socket.as_raw_fd(), &message, 0) >= 0 {
+                return true;
+            }
         }
+        self.txtime_errno.store(
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.txtime_errors.fetch_add(1, Ordering::Relaxed);
+        false
     }
 
     #[cfg(not(target_os = "linux"))]

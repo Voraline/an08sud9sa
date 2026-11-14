@@ -122,6 +122,10 @@ impl VoiceConnection {
         self.status() == VoiceConnectionStatus::Ready && self.network.txtime_active()
     }
 
+    pub fn txtime_errors(&self) -> (u64, i32) {
+        self.network.txtime_errors()
+    }
+
     pub fn dispatch_audio_at(&self, txtime_ns: u64) -> bool {
         if self.status() != VoiceConnectionStatus::Ready {
             return false;

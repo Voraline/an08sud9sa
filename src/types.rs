@@ -86,7 +86,7 @@ impl Default for PlaybackOptions {
             silence_padding_frames: 5,
             warmup_frames: 5,
             parallel_threshold: 4,
-            txtime: false,
+            txtime: true,
             txtime_lead: Duration::from_millis(3),
             bitrate: 128_000,
             opus_complexity: 10,

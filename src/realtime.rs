@@ -108,7 +108,7 @@ pub fn monotonic_ns() -> u64 {
     0
 }
 
-pub fn fq_status() -> String {
+pub fn fq_status() -> (Option<bool>, String) {
     use std::process::Command;
 
     let route = match Command::new("ip")
@@ -116,7 +116,7 @@ pub fn fq_status() -> String {
         .output()
     {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
-        _ => return "[SYNC] cannot verify fq: `ip` command unavailable".to_string(),
+        _ => return (None, "[SYNC] cannot verify fq: `ip` command unavailable".to_string()),
     };
     let iface = match route
         .split_whitespace()
@@ -124,18 +124,21 @@ pub fn fq_status() -> String {
         .nth(1)
     {
         Some(iface) => iface.to_string(),
-        None => return "[SYNC] cannot verify fq: no default interface found".to_string(),
+        None => return (None, "[SYNC] cannot verify fq: no default interface found".to_string()),
     };
     let text = match Command::new("tc").args(["qdisc", "show", "dev", &iface]).output() {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
-        _ => return format!("[SYNC] cannot verify fq on {iface}: `tc` command unavailable"),
+        _ => return (None, format!("[SYNC] cannot verify fq on {iface}: `tc` command unavailable")),
     };
     if text.split_whitespace().any(|word| word == "fq") {
-        format!("[SYNC] fq qdisc active on {iface}")
+        (Some(true), format!("[SYNC] fq qdisc active on {iface}"))
     } else {
         let found = text.lines().next().unwrap_or("none").trim().to_string();
-        format!(
-            "[SYNC] WARNING: fq qdisc NOT active on {iface} (found: {found}); packets will not be held. Run: sudo tc qdisc replace dev {iface} root fq"
+        (
+            Some(false),
+            format!(
+                "[SYNC] WARNING: fq qdisc NOT active on {iface} (found: {found}); txtime disabled. Run: sudo tc qdisc replace dev {iface} root fq"
+            ),
         )
     }
 }

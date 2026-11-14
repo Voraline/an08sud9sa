@@ -682,8 +682,17 @@ impl ClientInner {
         let parallel =
             count > 1 && count >= self.settings.parallel_threshold && cpus.len() >= count;
         let measure = self.settings.debug && count > 1;
-        let txtime = self.settings.txtime
+        let mut txtime = self.settings.txtime
             && active.iter().all(|target| target.connection.txtime_active());
+        let mut fq_missing = false;
+        if txtime {
+            let (state, message) = realtime::fq_status();
+            self.log(message);
+            if state == Some(false) {
+                txtime = false;
+                fq_missing = true;
+            }
+        }
 
         let frame_duration = Duration::from_millis(FRAME_MILLIS);
         let start_time = Instant::now() + self.settings.lead_time;
@@ -723,7 +732,7 @@ impl ClientInner {
         let mut sync_count = 0usize;
         let mut max_skew = 0i64;
 
-        if self.settings.txtime && !txtime {
+        if self.settings.txtime && !txtime && !fq_missing {
             let ready = active
                 .iter()
                 .filter(|target| target.connection.txtime_active())
@@ -736,17 +745,12 @@ impl ClientInner {
         }
 
         if txtime {
-            self.log(realtime::fq_status());
             let pinned = cpus
                 .last()
                 .map(|cpu| realtime::pin_current_thread(*cpu))
                 .unwrap_or(false);
             let realtime_ok = realtime::elevate_current_thread();
-            let spin = if realtime_ok {
-                REALTIME_SPIN_WINDOW
-            } else {
-                FALLBACK_SPIN_WINDOW
-            };
+            let spin = Duration::ZERO;
             self.log(format!(
                 "[SYNC] mode=txtime workers=1 realtime={} pinned={} locked={} lead={}us",
                 if realtime_ok { 1 } else { 0 },
@@ -801,6 +805,23 @@ impl ClientInner {
                 for target in &active {
                     prepare(target, frame);
                 }
+            }
+
+            let mut failed = false;
+            for (index, target) in active.iter().enumerate() {
+                let (count, errno) = target.connection.txtime_errors();
+                if count > 0 {
+                    failed = true;
+                    self.log(format!(
+                        "[SYNC] WARNING: bot {} had {} failed timed sends (last errno {})",
+                        index + 1,
+                        count,
+                        errno
+                    ));
+                }
+            }
+            if !failed {
+                self.log("[SYNC] txtime sends: no errors".to_string());
             }
         } else if parallel {
             self.log(format!(

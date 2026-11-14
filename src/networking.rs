@@ -260,19 +260,35 @@ impl Networking {
     }
 
     pub fn dispatch_audio_at(&self, txtime_ns: u64) -> bool {
-        let udp = self.inner.udp.lock().clone();
-        let sent = {
+        let Some(udp) = self.inner.udp.lock().clone() else {
+            return false;
+        };
+        let mut buffer = [0u8; 1500];
+        let length = {
             let mut shared = self.inner.shared.lock();
             if shared.code != NetCode::Ready || shared.prepared.is_empty() {
                 return false;
             }
-            let sent = udp
-                .map(|socket| socket.send_at(&shared.prepared, txtime_ns))
-                .unwrap_or(false);
+            let length = shared.prepared.len();
+            if length > buffer.len() {
+                let sent = udp.send_at(&shared.prepared, txtime_ns);
+                shared.prepared.clear();
+                return sent;
+            }
+            buffer[..length].copy_from_slice(&shared.prepared);
             shared.prepared.clear();
-            sent
+            length
         };
-        sent
+        udp.send_at(&buffer[..length], txtime_ns)
+    }
+
+    pub fn txtime_errors(&self) -> (u64, i32) {
+        self.inner
+            .udp
+            .lock()
+            .as_ref()
+            .map(|socket| socket.txtime_errors())
+            .unwrap_or((0, 0))
     }
 
     pub fn set_speaking(&self, speaking: bool) {

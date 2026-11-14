@@ -41,7 +41,7 @@ fn main() {
         options.ffmpeg_path = ffmpeg;
     }
     if let Ok(txtime) = std::env::var("VOICE_TXTIME") {
-        options.txtime = txtime == "1";
+        options.txtime = txtime != "0";
     }
     if let Ok(debug) = std::env::var("VOICE_DEBUG") {
         options.debug = debug != "0";
