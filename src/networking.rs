@@ -35,6 +35,7 @@ struct NetShared {
     prepared: Vec<u8>,
     dave_frame: Vec<u8>,
     speaking: bool,
+    txtime: bool,
     connected: HashSet<String>,
     external_sender: Option<Vec<u8>>,
     dave: Dave,
@@ -70,6 +71,7 @@ impl Networking {
             prepared: Vec::with_capacity(4096),
             dave_frame: Vec::with_capacity(4096),
             speaking: false,
+            txtime: false,
             connected: HashSet::new(),
             external_sender: None,
             dave: Dave::new(),
@@ -250,6 +252,26 @@ impl Networking {
                 ));
             }
         }
+        sent
+    }
+
+    pub fn txtime_active(&self) -> bool {
+        self.inner.shared.lock().txtime
+    }
+
+    pub fn dispatch_audio_at(&self, txtime_ns: u64) -> bool {
+        let udp = self.inner.udp.lock().clone();
+        let sent = {
+            let mut shared = self.inner.shared.lock();
+            if shared.code != NetCode::Ready || shared.prepared.is_empty() {
+                return false;
+            }
+            let sent = udp
+                .map(|socket| socket.send_at(&shared.prepared, txtime_ns))
+                .unwrap_or(false);
+            shared.prepared.clear();
+            sent
+        };
         sent
     }
 
@@ -479,6 +501,7 @@ fn handle_voice_ready(inner: &Arc<NetInner>, data: Option<&Value>, conn: &WsConn
         }
     };
 
+    let mut txtime_error: Option<String> = None;
     {
         let mut shared = inner.shared.lock();
         if shared.code == NetCode::Closed {
@@ -488,6 +511,20 @@ fn handle_voice_ready(inner: &Arc<NetInner>, data: Option<&Value>, conn: &WsConn
         }
         shared.ssrc = ssrc;
         shared.code = NetCode::UdpHandshaking;
+        if inner.options.txtime {
+            match udp.enable_txtime() {
+                Ok(()) => shared.txtime = true,
+                Err(error) => {
+                    shared.txtime = false;
+                    txtime_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+    if let Some(error) = txtime_error {
+        inner.state.emit_error(format!(
+            "SO_TXTIME unavailable ({error}); falling back to normal send. Run as root (CAP_NET_ADMIN) on Linux."
+        ));
     }
     *inner.udp.lock() = Some(udp.clone());
 

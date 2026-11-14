@@ -1,8 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const REALTIME_SPIN_WINDOW: Duration = Duration::from_micros(250);
 pub const FALLBACK_SPIN_WINDOW: Duration = Duration::from_millis(1);
+pub const BARRIER_LEAD: Duration = Duration::from_micros(100);
 const MAX_SLEEP_SLICE: Duration = Duration::from_millis(50);
 
 pub fn init_timer_resolution() {
@@ -90,6 +91,55 @@ pub fn elevate_current_thread() -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+pub fn monotonic_ns() -> u64 {
+    let mut spec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut spec);
+    }
+    spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn monotonic_ns() -> u64 {
+    0
+}
+
+pub fn fq_status() -> String {
+    use std::process::Command;
+
+    let route = match Command::new("ip")
+        .args(["-o", "route", "get", "1.1.1.1"])
+        .output()
+    {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
+        _ => return "[SYNC] cannot verify fq: `ip` command unavailable".to_string(),
+    };
+    let iface = match route
+        .split_whitespace()
+        .skip_while(|word| *word != "dev")
+        .nth(1)
+    {
+        Some(iface) => iface.to_string(),
+        None => return "[SYNC] cannot verify fq: no default interface found".to_string(),
+    };
+    let text = match Command::new("tc").args(["qdisc", "show", "dev", &iface]).output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout).to_string(),
+        _ => return format!("[SYNC] cannot verify fq on {iface}: `tc` command unavailable"),
+    };
+    if text.split_whitespace().any(|word| word == "fq") {
+        format!("[SYNC] fq qdisc active on {iface}")
+    } else {
+        let found = text.lines().next().unwrap_or("none").trim().to_string();
+        format!(
+            "[SYNC] WARNING: fq qdisc NOT active on {iface} (found: {found}); packets will not be held. Run: sudo tc qdisc replace dev {iface} root fq"
+        )
+    }
+}
+
 pub fn lock_memory() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -118,5 +168,46 @@ pub fn wait_until(deadline: Instant, spin: Duration, stopping: &AtomicBool) -> I
         } else {
             std::hint::spin_loop();
         }
+    }
+}
+
+pub struct SpinBarrier {
+    parties: usize,
+    arrived: AtomicUsize,
+    generation: AtomicUsize,
+    aborted: AtomicBool,
+}
+
+impl SpinBarrier {
+    pub fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            arrived: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
+            aborted: AtomicBool::new(false),
+        }
+    }
+
+    pub fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    pub fn wait(&self, stopping: &AtomicBool) -> bool {
+        if self.aborted.load(Ordering::Acquire) {
+            return false;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 == self.parties {
+            self.arrived.store(0, Ordering::Relaxed);
+            self.generation.fetch_add(1, Ordering::Release);
+            return true;
+        }
+        while self.generation.load(Ordering::Acquire) == generation {
+            if self.aborted.load(Ordering::Acquire) || stopping.load(Ordering::Relaxed) {
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
     }
 }

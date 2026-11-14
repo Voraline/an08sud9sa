@@ -118,6 +118,17 @@ impl VoiceConnection {
         self.network.dispatch_audio()
     }
 
+    pub fn txtime_active(&self) -> bool {
+        self.status() == VoiceConnectionStatus::Ready && self.network.txtime_active()
+    }
+
+    pub fn dispatch_audio_at(&self, txtime_ns: u64) -> bool {
+        if self.status() != VoiceConnectionStatus::Ready {
+            return false;
+        }
+        self.network.dispatch_audio_at(txtime_ns)
+    }
+
     pub fn set_speaking(&self, speaking: bool) {
         if self.status() != VoiceConnectionStatus::Ready {
             return;

@@ -11,7 +11,7 @@ use crate::connection::VoiceConnection;
 use crate::crypto;
 use crate::gateway::GatewayClient;
 use crate::opus;
-use crate::realtime::{self, FALLBACK_SPIN_WINDOW, REALTIME_SPIN_WINDOW};
+use crate::realtime::{self, SpinBarrier, BARRIER_LEAD, FALLBACK_SPIN_WINDOW, REALTIME_SPIN_WINDOW};
 use crate::types::{
     AudioPlayerStatus, BotOptions, EncodedAudio, EncoderOptions, JoinConfig, PlaybackOptions,
     VoiceConnectionStatus, VoiceServerInfo, VoiceStateInfo,
@@ -351,6 +351,7 @@ impl ClientInner {
             session_id: state.session_id,
             token: server.token,
             endpoint: server.endpoint,
+            txtime: self.settings.txtime,
         };
 
         let connection = VoiceConnection::new(self.config.clone(), options, self.settings.debug);
@@ -681,6 +682,8 @@ impl ClientInner {
         let parallel =
             count > 1 && count >= self.settings.parallel_threshold && cpus.len() >= count;
         let measure = self.settings.debug && count > 1;
+        let txtime = self.settings.txtime
+            && active.iter().all(|target| target.connection.txtime_active());
 
         let frame_duration = Duration::from_millis(FRAME_MILLIS);
         let start_time = Instant::now() + self.settings.lead_time;
@@ -720,7 +723,86 @@ impl ClientInner {
         let mut sync_count = 0usize;
         let mut max_skew = 0i64;
 
-        if parallel {
+        if self.settings.txtime && !txtime {
+            let ready = active
+                .iter()
+                .filter(|target| target.connection.txtime_active())
+                .count();
+            self.log(format!(
+                "[SYNC] WARNING: txtime requested but active on only {}/{} connections; falling back to normal send",
+                ready,
+                active.len()
+            ));
+        }
+
+        if txtime {
+            self.log(realtime::fq_status());
+            let pinned = cpus
+                .last()
+                .map(|cpu| realtime::pin_current_thread(*cpu))
+                .unwrap_or(false);
+            let realtime_ok = realtime::elevate_current_thread();
+            let spin = if realtime_ok {
+                REALTIME_SPIN_WINDOW
+            } else {
+                FALLBACK_SPIN_WINDOW
+            };
+            self.log(format!(
+                "[SYNC] mode=txtime workers=1 realtime={} pinned={} locked={} lead={}us",
+                if realtime_ok { 1 } else { 0 },
+                if pinned { 1 } else { 0 },
+                if locked { 1 } else { 0 },
+                self.settings.txtime_lead.as_micros()
+            ));
+
+            let start_mono = realtime::monotonic_ns()
+                + start_time
+                    .saturating_duration_since(Instant::now())
+                    .as_nanos() as u64;
+            let frame_ns = FRAME_MILLIS * 1_000_000;
+            let lead = self.settings.txtime_lead;
+
+            for target in &active {
+                prepare(target, 0);
+            }
+
+            let mut frame = 0usize;
+            while frame < maximum_frames {
+                let any_active = active
+                    .iter()
+                    .any(|target| target.player.status() != AudioPlayerStatus::Idle);
+                if !any_active || self.stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let release = deadline_of(frame);
+                let wake = release.checked_sub(lead).unwrap_or(release);
+                let now = realtime::wait_until(wake, spin, &self.stopping);
+                if self.stopping.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let skip = late_frames(frame, now);
+                if skip > 0 {
+                    for target in &active {
+                        for ahead in 1..=skip {
+                            prepare(target, frame + ahead);
+                        }
+                    }
+                    frame += skip;
+                }
+
+                let txtime_ns = start_mono + frame as u64 * frame_ns;
+                for target in &active {
+                    target.connection.dispatch_audio_at(txtime_ns);
+                }
+
+                frame += 1;
+                for target in &active {
+                    prepare(target, frame);
+                }
+            }
+        } else if parallel {
             self.log(format!(
                 "[SYNC] mode=parallel workers={} locked={}",
                 count,
@@ -735,8 +817,11 @@ impl ClientInner {
             .map(|_| AtomicI64::new(0))
             .collect();
 
+            let barrier = SpinBarrier::new(count);
+
             thread::scope(|scope| {
                 for (index, target) in active.iter().enumerate() {
+                    let barrier = &barrier;
                     let cpus = &cpus;
                     let stopping = &self.stopping;
                     let prepare = &prepare;
@@ -762,7 +847,15 @@ impl ClientInner {
                                 break;
                             }
 
-                            let now = realtime::wait_until(deadline_of(frame), spin, stopping);
+                            let deadline = deadline_of(frame);
+                            let rendezvous = deadline.checked_sub(BARRIER_LEAD).unwrap_or(deadline);
+                            realtime::wait_until(rendezvous, spin, stopping);
+                            if stopping.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            barrier.wait(stopping);
+
+                            let now = realtime::wait_until(deadline, spin, stopping);
                             if stopping.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -787,6 +880,7 @@ impl ClientInner {
                             frame += 1;
                             prepare(target, frame);
                         }
+                        barrier.abort();
                     });
                 }
             });

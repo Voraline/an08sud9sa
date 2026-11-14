@@ -40,8 +40,11 @@ fn main() {
     if let Ok(ffmpeg) = std::env::var("FFMPEG_PATH") {
         options.ffmpeg_path = ffmpeg;
     }
+    if let Ok(txtime) = std::env::var("VOICE_TXTIME") {
+        options.txtime = txtime == "1";
+    }
     if let Ok(debug) = std::env::var("VOICE_DEBUG") {
-        options.debug = debug == "1";
+        options.debug = debug != "0";
     }
 
     let client = VoiceClient::new(bots, config, options);

@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 use socket2::{Domain, Protocol, Socket, Type};
 
+#[cfg(target_os = "linux")]
+const SO_TXTIME: libc::c_int = 61;
+#[cfg(target_os = "linux")]
+const SCM_TXTIME: libc::c_int = SO_TXTIME;
 const DISCOVERY_SIZE: usize = 74;
 const KEEPALIVE_SIZE: usize = 8;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -41,6 +45,7 @@ pub struct VoiceUdpSocket {
     shared: Arc<Shared>,
     receive_thread: Mutex<Option<JoinHandle<()>>>,
     keepalive_thread: Mutex<Option<JoinHandle<()>>>,
+    txtime: AtomicBool,
 }
 
 impl VoiceUdpSocket {
@@ -76,6 +81,7 @@ impl VoiceUdpSocket {
             shared: shared.clone(),
             receive_thread: Mutex::new(None),
             keepalive_thread: Mutex::new(None),
+            txtime: AtomicBool::new(false),
         });
 
         let receive_shared = shared.clone();
@@ -95,6 +101,84 @@ impl VoiceUdpSocket {
 
     pub fn send(&self, data: &[u8]) -> bool {
         self.socket.send(data).is_ok()
+    }
+
+    pub fn txtime_active(&self) -> bool {
+        self.txtime.load(Ordering::Relaxed)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn enable_txtime(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        #[repr(C)]
+        struct SockTxtime {
+            clockid: i32,
+            flags: u32,
+        }
+
+        let config = SockTxtime {
+            clockid: libc::CLOCK_MONOTONIC,
+            flags: 0,
+        };
+        let result = unsafe {
+            libc::setsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                SO_TXTIME,
+                &config as *const SockTxtime as *const libc::c_void,
+                std::mem::size_of::<SockTxtime>() as libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            self.txtime.store(false, Ordering::Relaxed);
+            return Err(std::io::Error::last_os_error());
+        }
+        self.txtime.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable_txtime(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SO_TXTIME is only available on Linux",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn send_at(&self, data: &[u8], txtime_ns: u64) -> bool {
+        use std::os::fd::AsRawFd;
+
+        if !self.txtime.load(Ordering::Relaxed) {
+            return self.send(data);
+        }
+
+        let mut control = [0u64; 4];
+        let mut iov = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        };
+        unsafe {
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            message.msg_controllen = libc::CMSG_SPACE(8) as _;
+
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = libc::SOL_SOCKET;
+            (*header).cmsg_type = SCM_TXTIME;
+            (*header).cmsg_len = libc::CMSG_LEN(8) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(header) as *mut u64, txtime_ns);
+
+            libc::sendmsg(self.socket.as_raw_fd(), &message, 0) >= 0
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn send_at(&self, data: &[u8], _txtime_ns: u64) -> bool {
+        self.send(data)
     }
 
     pub fn perform_ip_discovery(&self, ssrc: u32) -> Option<SocketConfig> {

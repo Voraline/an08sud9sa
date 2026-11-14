@@ -24,6 +24,7 @@ pub struct ConnectionOptions {
     pub session_id: String,
     pub token: String,
     pub endpoint: String,
+    pub txtime: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,6 +69,8 @@ pub struct PlaybackOptions {
     pub silence_padding_frames: usize,
     pub warmup_frames: usize,
     pub parallel_threshold: usize,
+    pub txtime: bool,
+    pub txtime_lead: Duration,
     pub bitrate: u32,
     pub opus_complexity: u8,
     pub ffmpeg_path: String,
@@ -83,10 +86,12 @@ impl Default for PlaybackOptions {
             silence_padding_frames: 5,
             warmup_frames: 5,
             parallel_threshold: 4,
+            txtime: false,
+            txtime_lead: Duration::from_millis(3),
             bitrate: 128_000,
             opus_complexity: 10,
             ffmpeg_path: "ffmpeg".to_string(),
-            debug: false,
+            debug: true,
         }
     }
 }
