@@ -26,7 +26,7 @@ audiopus_sys = { version = "0.2.2", features = ["static"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2.191"
-nix = { version = "0.31.3", features = ["sched", "mman", "process"] }
+nix = { version = "0.32.0", features = ["sched", "mman", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
