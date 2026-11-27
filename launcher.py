@@ -186,12 +186,17 @@ KERNEL_TUNES = [
 NETWORK_TUNES = [
     ("net/core/wmem_max", "4194304"),
     ("net/core/rmem_max", "4194304"),
+    ("net/core/rmem_default", "4194304"),
+    ("net/core/wmem_default", "4194304"),
+    ("net/core/optmem_max", "8388608"),
     ("net/core/netdev_max_backlog", "5000"),
     ("net/core/busy_read", "50"),
     ("net/core/busy_poll", "50"),
     ("net/ipv4/udp_rmem_min", "65536"),
     ("net/ipv4/udp_wmem_min", "65536"),
     ("net/ipv4/tcp_low_latency", "1"),
+    ("net/ipv4/tcp_slow_start_after_idle", "0"),
+    ("net/unix/max_dgram_qlen", "1024"),
 ]
 
 
@@ -290,6 +295,111 @@ def TuneProcess():
     return Results
 
 
+def TuneIRQ(InterfaceOverride):
+    """Stop irqbalance and pin NIC IRQs to CPU 0 to reduce interrupt jitter."""
+    if not sys.platform.startswith("linux"):
+        return [("irq", False, "only available on Linux")]
+    Results = []
+
+    # Stop irqbalance so it doesn't fight our manual pinning
+    if shutil.which("systemctl"):
+        try:
+            Result = subprocess.run(
+                WithPrivilege(["systemctl", "stop", "irqbalance"]),
+                capture_output=True, text=True, timeout=10,
+            )
+            Results.append((
+                "irqbalance",
+                Result.returncode == 0,
+                "stopped" if Result.returncode == 0 else (Result.stderr or "failed").strip(),
+            ))
+        except (OSError, subprocess.SubprocessError) as Error:
+            Results.append(("irqbalance", False, str(Error)))
+
+    # Find the NIC and pin its IRQs to CPU 0
+    Interface = InterfaceOverride or DetectInterface()
+    if not Interface:
+        Results.append(("nic-irq", False, "could not detect interface"))
+        return Results
+
+    IrqDir = Path(f"/sys/class/net/{Interface}/device/msi_irqs")
+    if not IrqDir.is_dir():
+        Results.append(("nic-irq", False, f"no msi_irqs for {Interface}"))
+        return Results
+
+    Pinned = 0
+    for IrqPath in IrqDir.iterdir():
+        AffinityFile = Path(f"/proc/irq/{IrqPath.name}/smp_affinity_list")
+        if not AffinityFile.exists():
+            continue
+        try:
+            Result = subprocess.run(
+                WithPrivilege(["tee", str(AffinityFile)]),
+                input="0", capture_output=True, text=True, timeout=5,
+            )
+            if Result.returncode == 0:
+                Pinned += 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if Pinned > 0:
+        Results.append(("nic-irq", True, f"pinned {Pinned} IRQ(s) on {Interface} to CPU 0"))
+    else:
+        Results.append(("nic-irq", False, f"no IRQs pinned on {Interface}"))
+
+    return Results
+
+
+def TuneUDPMem():
+    """Set UDP memory pressure thresholds (min/pressure/max pages)."""
+    if not sys.platform.startswith("linux"):
+        return [("udp_mem", False, "only available on Linux")]
+    Results = []
+
+    Key = "net/ipv4/udp_mem"
+    PathValue = Path("/proc/sys") / Key
+    Name = "net.ipv4.udp_mem"
+    Value = "102400 873800 16777216"
+
+    if not PathValue.is_file():
+        return [(Name, False, "not available on this kernel")]
+
+    try:
+        Result = subprocess.run(
+            WithPrivilege(["sysctl", "-w", f"{Name}={Value}"]),
+            capture_output=True, text=True, timeout=10,
+        )
+        if Result.returncode == 0:
+            Results.append((Name, True, f"set to {Value}"))
+        else:
+            Reason = (Result.stderr or Result.stdout).strip()
+            Results.append((Name, False, Reason or "failed"))
+    except (OSError, subprocess.SubprocessError) as Error:
+        Results.append((Name, False, str(Error)))
+
+    return Results
+
+
+def TuneCpuLatency():
+    """Write 0 to /dev/cpu_dma_latency to prevent deep C-states during playback."""
+    if not sys.platform.startswith("linux"):
+        return [("cpu_dma_latency", False, "only available on Linux")]
+
+    LatencyFile = Path("/dev/cpu_dma_latency")
+    if not LatencyFile.exists():
+        return [("cpu_dma_latency", False, "not available")]
+
+    try:
+        # Open and keep the fd alive — closing it resets the latency
+        # We store it on the function so it stays open for the process lifetime
+        Fd = open(str(LatencyFile), "wb", buffering=0)
+        Fd.write(b"\x00\x00\x00\x00")  # 0 microseconds = no deep C-states
+        TuneCpuLatency._fd = Fd  # keep alive
+        return [("cpu_dma_latency", True, "set to 0us (deep C-states blocked)")]
+    except OSError as Error:
+        return [("cpu_dma_latency", False, str(Error))]
+
+
 def ClockSource():
     try:
         return Path("/sys/devices/system/clocksource/clocksource0/current_clocksource").read_text().strip()
@@ -313,6 +423,9 @@ def Main():
     Parser.add_argument("--no-tune", action="store_true", help="Do not apply kernel scheduler tweaks")
     Parser.add_argument("--no-net-tune", action="store_true", help="Do not apply network socket tuning")
     Parser.add_argument("--no-proc-tune", action="store_true", help="Do not apply ionice/renice to this process")
+    Parser.add_argument("--no-irq-tune", action="store_true", help="Do not stop irqbalance or pin NIC IRQs")
+    Parser.add_argument("--no-udp-mem", action="store_true", help="Do not tune net.ipv4.udp_mem")
+    Parser.add_argument("--no-cstate", action="store_true", help="Do not block deep CPU C-states")
     Parser.add_argument("--fq-slack", default="1us", help="fq timer slack (default: 1us)")
     Parser.add_argument("--iface", help="Network interface for fq (default: auto-detect)")
     Mode = Parser.add_mutually_exclusive_group()
@@ -409,6 +522,24 @@ def Main():
         else:
             for Name, Applied, Message in TuneProcess():
                 print(f"[PROC] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+
+        if Arguments.no_irq_tune:
+            print("[IRQ] OFF - disabled with --no-irq-tune")
+        else:
+            for Name, Applied, Message in TuneIRQ(Arguments.iface):
+                print(f"[IRQ] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+
+        if Arguments.no_udp_mem:
+            print("[UDPMEM] OFF - disabled with --no-udp-mem")
+        else:
+            for Name, Applied, Message in TuneUDPMem():
+                print(f"[UDPMEM] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+
+        if Arguments.no_cstate:
+            print("[CSTATE] OFF - disabled with --no-cstate")
+        else:
+            for Name, Applied, Message in TuneCpuLatency():
+                print(f"[CSTATE] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
 
         if TxTime and not IsRoot() and not shutil.which("sudo"):
             print("[TXTIME] OFF - needs root (CAP_NET_ADMIN) and sudo was not found")
