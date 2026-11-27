@@ -201,6 +201,20 @@ FS_TUNES = [
 TCP_TUNES = [
     ("net/ipv4/tcp_fastopen", "1"),
     ("net/ipv4/tcp_fin_timeout", "15"),
+    ("net/ipv4/tcp_rmem", "4096 16777216 67108864"),
+    ("net/ipv4/tcp_wmem", "4096 16777216 67108864"),
+    ("net/ipv4/tcp_mem", "2097152 4194304 8388608"),
+    ("net/core/somaxconn", "65535"),
+    ("net/ipv4/tcp_max_syn_backlog", "8192"),
+    ("net/ipv4/tcp_keepalive_time", "60"),
+    ("net/ipv4/tcp_keepalive_intvl", "10"),
+    ("net/ipv4/tcp_keepalive_probes", "6"),
+]
+
+WRITEBACK_TUNES = [
+    ("vm/dirty_expire_centisecs", "1500"),
+    ("vm/dirty_writeback_centisecs", "250"),
+    ("fs/inotify/max_user_instances", "512"),
 ]
 
 NETWORK_TUNES = [
@@ -533,6 +547,8 @@ def Main():
                 print(f"[FS] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
             for Name, Applied, Message in ApplySysctlTunes(TCP_TUNES, "tcp tuning"):
                 print(f"[TCP] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+            for Name, Applied, Message in ApplySysctlTunes(WRITEBACK_TUNES, "writeback tuning"):
+                print(f"[WB] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
             Clock = ClockSource()
             if Clock:
                 print(f"[TUNE] clocksource: {Clock}")
