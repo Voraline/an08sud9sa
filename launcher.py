@@ -181,6 +181,26 @@ def SetupFq(InterfaceOverride, Slack):
 KERNEL_TUNES = [
     ("kernel/sched_autogroup_enabled", "0"),
     ("kernel/timer_migration", "0"),
+    ("kernel/sched_rt_runtime_us", "-1"),
+]
+
+VM_TUNES = [
+    ("vm/swappiness", "0"),
+    ("vm/vfs_cache_pressure", "50"),
+    ("vm/dirty_background_ratio", "2"),
+    ("vm/dirty_ratio", "5"),
+    ("vm/overcommit_memory", "1"),
+    ("vm/max_map_count", "262144"),
+]
+
+FS_TUNES = [
+    ("fs/file-max", "2097152"),
+    ("fs/inotify/max_user_watches", "524288"),
+]
+
+TCP_TUNES = [
+    ("net/ipv4/tcp_fastopen", "1"),
+    ("net/ipv4/tcp_fin_timeout", "15"),
 ]
 
 NETWORK_TUNES = [
@@ -507,6 +527,12 @@ def Main():
         else:
             for Name, Applied, Message in TuneKernel():
                 print(f"[TUNE] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+            for Name, Applied, Message in ApplySysctlTunes(VM_TUNES, "vm tuning"):
+                print(f"[VM] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+            for Name, Applied, Message in ApplySysctlTunes(FS_TUNES, "fs tuning"):
+                print(f"[FS] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+            for Name, Applied, Message in ApplySysctlTunes(TCP_TUNES, "tcp tuning"):
+                print(f"[TCP] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
             Clock = ClockSource()
             if Clock:
                 print(f"[TUNE] clocksource: {Clock}")
