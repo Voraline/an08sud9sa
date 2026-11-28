@@ -217,6 +217,12 @@ WRITEBACK_TUNES = [
     ("fs/inotify/max_user_instances", "512"),
 ]
 
+JITTER_TUNES = [
+    ("kernel/watchdog", "0"),
+    ("vm/stat_interval", "10"),
+    ("vm/compaction_proactiveness", "0"),
+]
+
 NETWORK_TUNES = [
     ("net/core/wmem_max", "4194304"),
     ("net/core/rmem_max", "4194304"),
@@ -249,7 +255,7 @@ def ApplySysctlTunes(Tunes, Label):
         except OSError as Error:
             Results.append((Name, False, f"cannot read: {Error}"))
             continue
-        if Current == Value:
+        if Current.split() == Value.split():
             Results.append((Name, True, f"already {Value}"))
             continue
         try:
@@ -270,7 +276,7 @@ def ApplySysctlTunes(Tunes, Label):
             Now = PathValue.read_text().strip()
         except OSError:
             Now = Value
-        if Now == Value:
+        if Now.split() == Value.split():
             Results.append((Name, True, f"set to {Value} (was {Current})"))
         else:
             Results.append((Name, False, f"sysctl ran but value is still {Now}"))
@@ -335,11 +341,13 @@ def TuneIRQ(InterfaceOverride):
         return [("irq", False, "only available on Linux")]
     Results = []
 
-    # Stop irqbalance so it doesn't fight our manual pinning
-    if shutil.which("systemctl"):
+    # Stop irqbalance only if it is actually running (otherwise nothing to report)
+    if shutil.which("pgrep") and subprocess.run(
+        ["pgrep", "-x", "irqbalance"], capture_output=True
+    ).returncode == 0:
         try:
             Result = subprocess.run(
-                WithPrivilege(["systemctl", "stop", "irqbalance"]),
+                WithPrivilege(["pkill", "-x", "irqbalance"]),
                 capture_output=True, text=True, timeout=10,
             )
             Results.append((
@@ -349,6 +357,8 @@ def TuneIRQ(InterfaceOverride):
             ))
         except (OSError, subprocess.SubprocessError) as Error:
             Results.append(("irqbalance", False, str(Error)))
+    else:
+        Results.append(("irqbalance", True, "not running, nothing to stop"))
 
     # Find the NIC and pin its IRQs to CPU 0
     Interface = InterfaceOverride or DetectInterface()
@@ -415,7 +425,7 @@ def TuneUDPMem():
 
 
 def TuneCpuLatency():
-    """Write 0 to /dev/cpu_dma_latency to prevent deep C-states during playback."""
+    """Hold /dev/cpu_dma_latency at 0us so the CPU avoids deep C-states."""
     if not sys.platform.startswith("linux"):
         return [("cpu_dma_latency", False, "only available on Linux")]
 
@@ -423,15 +433,34 @@ def TuneCpuLatency():
     if not LatencyFile.exists():
         return [("cpu_dma_latency", False, "not available")]
 
+    if IsRoot():
+        try:
+            Fd = open(str(LatencyFile), "wb", buffering=0)
+            Fd.write(b"\x00\x00\x00\x00")
+            TuneCpuLatency._fd = Fd
+            return [("cpu_dma_latency", True, "set to 0us (deep C-states blocked)")]
+        except OSError as Error:
+            return [("cpu_dma_latency", False, str(Error))]
+
+    if not shutil.which("sudo"):
+        return [("cpu_dma_latency", False, "needs root and sudo was not found")]
+
+    # Not root: a small sudo helper holds the fd open until we exit.
+    import atexit
     try:
-        # Open and keep the fd alive — closing it resets the latency
-        # We store it on the function so it stays open for the process lifetime
-        Fd = open(str(LatencyFile), "wb", buffering=0)
-        Fd.write(b"\x00\x00\x00\x00")  # 0 microseconds = no deep C-states
-        TuneCpuLatency._fd = Fd  # keep alive
-        return [("cpu_dma_latency", True, "set to 0us (deep C-states blocked)")]
+        Holder = subprocess.Popen(
+            ["sudo", "sh", "-c",
+             "exec 3>/dev/cpu_dma_latency && printf '\\000\\000\\000\\000' >&3 && exec sleep 2147483647"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     except OSError as Error:
         return [("cpu_dma_latency", False, str(Error))]
+    atexit.register(lambda: Holder.poll() is None and Holder.terminate())
+    try:
+        Holder.wait(timeout=1.0)
+        return [("cpu_dma_latency", False, "helper exited early (no permission?)")]
+    except subprocess.TimeoutExpired:
+        return [("cpu_dma_latency", True, "set to 0us via sudo helper (deep C-states blocked)")]
 
 
 def ClockSource():
@@ -549,6 +578,8 @@ def Main():
                 print(f"[TCP] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
             for Name, Applied, Message in ApplySysctlTunes(WRITEBACK_TUNES, "writeback tuning"):
                 print(f"[WB] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
+            for Name, Applied, Message in ApplySysctlTunes(JITTER_TUNES, "jitter tuning"):
+                print(f"[JITTER] {'ON ' if Applied else 'OFF'} - {Name}: {Message}")
             Clock = ClockSource()
             if Clock:
                 print(f"[TUNE] clocksource: {Clock}")
